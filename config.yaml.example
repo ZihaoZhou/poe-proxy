@@ -1,0 +1,7 @@
+port: 12345
+ssl: false
+ssl_dir: /etc/letsencrypt/live/example.com/
+api_key: YOUR_ACTUAL_POE_API_KEY
+extra_api_keys:
+  - YOUR_CUSTOM_API_KEY_1
+  - YOUR_CUSTOM_API_KEY_2

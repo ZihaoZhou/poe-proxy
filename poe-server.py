@@ -206,4 +206,4 @@ if __name__ == "__main__":
     if config["ssl"]:
         app.run("::", port, ssl=config["ssl_dir"])
     else:
-        app.run(host="0.0.0.0", port=port, dev=True)
+        app.run(host="0.0.0.0", port=port)

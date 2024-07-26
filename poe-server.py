@@ -10,6 +10,9 @@ from sanic_cors import CORS
 from base64 import urlsafe_b64encode 
 import time
 import yaml
+from fastapi_poe.client import PROTOCOL_VERSION, stream_request_base
+from fastapi_poe.types import QueryRequest, ToolResultDefinition, ToolCallDefinition
+from aggregate import aggregate_chunk
 
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -55,23 +58,18 @@ api = API()
 app = Sanic("Poe")
 CORS(app)
 
-model_adapter = {
-    'gpt-3.5-turbo': 'GPT-3.5-Turbo',
-    'gpt-3.5-turbo-0301': 'GPT-3.5-Turbo',
-    'gpt-3.5-turbo-0613': 'GPT-3.5-Turbo',
-    'gpt-3.5-turbo-16k': 'GPT-3.5-Turbo',
-    'gpt-3.5-turbo-16k-0613': 'GPT-3.5-Turbo',
-    'gpt-3.5-turbo-1106': 'GPT-3.5-Turbo',
-    'gpt-3.5-turbo-0125': 'GPT-3.5-Turbo',
-    'gpt-4': 'GPT-4',
-    'gpt-4-0314': 'GPT-4',
-    'gpt-4-0613': 'GPT-4',
-    'gpt-4-32k': 'GPT-4',
-    'gpt-4-32k-0314': 'GPT-4',
-    'gpt-4-32k-0613': 'GPT-4',
-    'gpt-4-1106-preview': 'GPT-4',
-    'gpt-4-0125-preview': 'GPT-4'
-}
+
+def adapt_model(model_name):
+    if model_name.startswith("gpt-3.5-turbo"):
+        return "GPT-3.5-Turbo"
+    elif model_name.startswith("gpt-4o-mini"):
+        return "GPT-4o-mini"
+    elif model_name.startswith("gpt-4o"):
+        return "GPT-4o"
+    elif model_name.startswith("gpt-4"):
+        return "GPT-4"
+    else:
+        return model_name
 
 
 @app.route("/v1/engines")
@@ -93,10 +91,19 @@ async def v1_engines_completions(request):
     messages = kws.pop("messages", None)
     
     model = kws.pop("model", "GPT-4")
-    if model in model_adapter:
-        model = model_adapter[model]
-    temperature = kws.pop("temperature", 1)
+    model = adapt_model(model)
+    stop_sequences = kws.pop("stop", [])
+    logit_bias = kws.pop("logit_bias", {})
+    temperature = kws.pop("temperature", 0.7)
+    language_code = kws.pop("language", "en")
     stream = kws.pop("stream", False)
+    tools_dict_list = kws.pop("tools", None)
+    if tools_dict_list is None:
+        tools = None
+    else:
+        tools = [fp.ToolDefinition(**tools_dict) for tools_dict in tools_dict_list]
+    if type(stop_sequences) is str:
+        stop_sequences = [stop_sequences]
     
     api_key = request.headers.get("Authorization", "").split("Bearer ")[-1]
     if any([api_key == key for key in config["extra_api_keys"]]):
@@ -106,54 +113,88 @@ async def v1_engines_completions(request):
         return json({"error": "API key and prompt are required"}, status=400)
 
     protocol_messages = []
+    tool_calls = None
+    tool_results = None
     for message in messages:
         if "role" not in message:
             return json({"error": "role is required in message"}, status=400)
         if "content" not in message:
             return json({"error": "content is required in message"}, status=400)
-        role = message["role"].replace("assistant", "bot")
-        if "GPT" not in model or "Gemini" not in model or "gpt" not in model:
-            if role == "system":
-                continue
-        protocol_messages.append(
-            fp.ProtocolMessage(
-                role=role,
-                content=message["content"]
+        if "tool_calls" in message:  # tool_results
+            tool_calls = []
+            for tool_call in message["tool_calls"]:
+                tool_calls.append(ToolCallDefinition(
+                    id=tool_call["id"],
+                    function=ToolCallDefinition.FunctionDefinition(
+                        name=tool_call["function"]["name"],
+                        arguments=tool_call["function"]["arguments"]
+                    ),
+                    type=tool_call["type"]
+                ))
+        elif "tool_call_id" in message:
+            if tool_results is None:
+                tool_results = []
+            tool_results.append(ToolResultDefinition(**message))
+        else:
+            role = message["role"].replace("assistant", "bot")
+            if "GPT" not in model or "Gemini" not in model or "gpt" not in model:
+                if role == "system":
+                    continue
+            protocol_messages.append(
+                fp.ProtocolMessage(
+                    role=role,
+                    content=message["content"]
+                )
             )
-        )
-
+    query = QueryRequest(
+        query=protocol_messages,
+        user_id="",
+        conversation_id="",
+        message_id="",
+        version=PROTOCOL_VERSION,
+        type="query",
+        temperature=temperature,
+        skip_system_prompt=False,
+        language_code=language_code,
+        stop_sequences=stop_sequences,
+        logit_bias=logit_bias,
+    )
+    
     if stream:
-        i = 0
         flag = True
-        
         try:
-            async for partial in fp.get_bot_response(
-                messages=protocol_messages, 
-                bot_name=model, 
+            async for partial in stream_request_base(
+                request=query,
+                bot_name=model,
                 api_key=api_key,
-                temperature=temperature
+                tools=tools,
+                tool_calls=tool_calls,
+                tool_results=tool_results
             ):
-                chunk = {
-                    "id": f"chatcmpl-{secrets.token_hex(16)}",
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "created": int(time.time()),
-                    "choices": [
-                        {
-                            "delta": {
-                                "content": partial.text,
-                                "function_call": None,
-                                "role": "assistant",
-                                "tool_calls": None
-                            },
-                            "finish_reason": None,
-                            "index": i,
-                            "logprobs": None
-                        }
-                    ],
-                    "system_fingerprint": f"fp_{secrets.token_hex(8)}"
-                }
-                i += 1
+                if partial.data is None:
+                    # Handle text completion chunk
+                    chunk = {
+                        "id": f"chatcmpl-{secrets.token_hex(16)}",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "created": int(time.time()),
+                        "choices": [
+                            {
+                                "delta": {
+                                    "content": partial.text,
+                                    "function_call": None,
+                                    "role": "assistant",
+                                    "tool_calls": None
+                                },
+                                "finish_reason": None,
+                                "index": 0,
+                                "logprobs": None
+                            }
+                        ],
+                        "system_fingerprint": f"fp_{secrets.token_hex(8)}"
+                    }
+                else:
+                    chunk = partial.data
                 if flag:
                     response = await request.respond()
                     flag = False
@@ -164,41 +205,51 @@ async def v1_engines_completions(request):
     else:
         # Handle static API call
         partial_responses = []
+        tool_flag = False
         try:
-            async for partial in fp.get_bot_response(
-                messages=protocol_messages,
+            async for partial in stream_request_base(
+                request=query,
                 bot_name=model,
                 api_key=api_key,
-                temperature=temperature
+                tools=tools,
+                tool_calls=tool_calls,
+                tool_results=tool_results
             ):
-                partial_responses.append(partial.text)
+                if partial.data is None:
+                    partial_responses.append(partial.text)
+                else:
+                    tool_flag = True
+                    partial_responses.append(loads(dumps(partial.data, default=lambda obj: obj.__dict__)))
             
-            bot_response = "".join(partial_responses)
         except Exception as e:
             return poe_exception_handler(e)
         
-        response = {
-            "id": f"chatcmpl-{secrets.token_hex(16)}",
-            "object": "chat.completion",
-            "model": model,
-            "created": int(time.time()),
-            "choices": [
-                {
-                    "message": {
-                        "content": bot_response,
-                        "role": "assistant"
-                    },
-                    "finish_reason": "stop",
-                    "index": 0
+        if tool_flag:
+            return json(aggregate_chunk(partial_responses))
+        else:
+            bot_response = "".join(partial_responses)
+            response = {
+                "id": f"chatcmpl-{secrets.token_hex(16)}",
+                "object": "chat.completion",
+                "model": model,
+                "created": int(time.time()),
+                "choices": [
+                    {
+                        "message": {
+                            "content": bot_response,
+                            "role": "assistant"
+                        },
+                        "finish_reason": "stop",
+                        "index": 0
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": sum(len(m.content) for m in protocol_messages),
+                    "completion_tokens": len(bot_response),
+                    "total_tokens": sum(len(m.content) for m in protocol_messages) + len(bot_response)
                 }
-            ],
-            "usage": {
-                "prompt_tokens": sum(len(m.content) for m in protocol_messages),
-                "completion_tokens": len(bot_response),
-                "total_tokens": sum(len(m.content) for m in protocol_messages) + len(bot_response)
             }
-        }
-        return json(response)
+            return json(response)
 
 
 if __name__ == "__main__":
@@ -206,4 +257,4 @@ if __name__ == "__main__":
     if config["ssl"]:
         app.run("::", port, ssl=config["ssl_dir"])
     else:
-        app.run(host="0.0.0.0", port=port)
+        app.run(host="0.0.0.0", port=port, auto_reload=True, debug=True)

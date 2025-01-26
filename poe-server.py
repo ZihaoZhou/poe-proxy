@@ -254,6 +254,8 @@ async def v1_engines_completions(request):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", config["port"]))
+    if "USE_HTTP" in os.environ and os.environ["USE_HTTP"].lower() == "true":
+        config["ssl"] = False
     if config["ssl"]:
         app.run("::", port, ssl=config["ssl_dir"])
     else:

@@ -1,6 +1,7 @@
 import os
 import secrets
 import fastapi_poe as fp
+import logging
 
 from sanic import Sanic
 from sanic.response import json
@@ -13,6 +14,13 @@ import yaml
 from fastapi_poe.client import PROTOCOL_VERSION, stream_request_base
 from fastapi_poe.types import QueryRequest, ToolResultDefinition, ToolCallDefinition
 from aggregate import aggregate_chunk
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('poe_proxy')
 
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
@@ -59,19 +67,6 @@ app = Sanic("Poe")
 CORS(app)
 
 
-def adapt_model(model_name):
-    if model_name.startswith("gpt-3.5-turbo"):
-        return "GPT-3.5-Turbo"
-    elif model_name.startswith("gpt-4o-mini"):
-        return "GPT-4o-mini"
-    elif model_name.startswith("gpt-4o"):
-        return "GPT-4o"
-    elif model_name.startswith("gpt-4"):
-        return "GPT-4"
-    else:
-        return model_name
-
-
 @app.route("/v1/engines")
 async def v1_engines_list(request):
     res = {"object": "list", "data": []}
@@ -85,13 +80,40 @@ def random_id(prefix, nbytes=18):
     return prefix + "-" + urlsafe_b64encode(token).decode("utf8")
 
 
+async def try_api_keys(request_func, api_keys):
+    """
+    Try multiple API keys in sequence until one succeeds or all fail.
+    
+    Args:
+        request_func: Async function that takes an API key and returns a response
+        api_keys: List of API keys to try
+        
+    Returns:
+        The result of the first successful API call, or raises the last exception
+    """
+    if not isinstance(api_keys, list):
+        api_keys = [api_keys]
+    
+    last_exception = None
+    for i, key in enumerate(api_keys):
+        try:
+            logger.info(f"Attempting with API key {i + 1}/{len(api_keys)}")
+            return await request_func(key)
+        except Exception as e:
+            logger.warning(f"API key {i + 1}/{len(api_keys)} failed: {str(e)}")
+            last_exception = e
+    
+    # If we get here, all keys have failed
+    logger.error(f"All API keys failed. Last error: {str(last_exception)}")
+    raise last_exception
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 async def v1_engines_completions(request):
     kws = request.json
     messages = kws.pop("messages", None)
     
     model = kws.pop("model", "GPT-4")
-    model = adapt_model(model)
     stop_sequences = kws.pop("stop", [])
     logit_bias = kws.pop("logit_bias", {})
     temperature = kws.pop("temperature", 0.7)
@@ -161,12 +183,15 @@ async def v1_engines_completions(request):
     )
     
     if stream:
-        flag = True
-        try:
+        # Define the streaming request function to use with multiple API keys
+        async def make_stream_request(current_api_key):
+            flag = True
+            response = None
+            
             async for partial in stream_request_base(
                 request=query,
                 bot_name=model,
-                api_key=api_key,
+                api_key=current_api_key,
                 tools=tools,
                 tool_calls=tool_calls,
                 tool_results=tool_results
@@ -195,22 +220,31 @@ async def v1_engines_completions(request):
                     }
                 else:
                     chunk = partial.data
+                
                 if flag:
                     response = await request.respond()
                     flag = False
+                
                 await response.send("data: " + dumps(chunk) + "\n\n")
+            
             await response.send("data: [DONE]\n\n")
+            return True
+            
+        try:
+            await try_api_keys(make_stream_request, config["api_key"])
         except Exception as e:
             return poe_exception_handler(e)
+            
     else:
-        # Handle static API call
-        partial_responses = []
-        tool_flag = False
-        try:
+        # Define the static request function to use with multiple API keys
+        async def make_static_request(current_api_key):
+            partial_responses = []
+            tool_flag = False
+            
             async for partial in stream_request_base(
                 request=query,
                 bot_name=model,
-                api_key=api_key,
+                api_key=current_api_key,
                 tools=tools,
                 tool_calls=tool_calls,
                 tool_results=tool_results
@@ -221,35 +255,37 @@ async def v1_engines_completions(request):
                     tool_flag = True
                     partial_responses.append(loads(dumps(partial.data, default=lambda obj: obj.__dict__)))
             
+            if tool_flag:
+                return aggregate_chunk(partial_responses)
+            else:
+                bot_response = "".join(partial_responses)
+                return {
+                    "id": f"chatcmpl-{secrets.token_hex(16)}",
+                    "object": "chat.completion",
+                    "model": model,
+                    "created": int(time.time()),
+                    "choices": [
+                        {
+                            "message": {
+                                "content": bot_response,
+                                "role": "assistant"
+                            },
+                            "finish_reason": "stop",
+                            "index": 0
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": sum(len(m.content) for m in protocol_messages),
+                        "completion_tokens": len(bot_response),
+                        "total_tokens": sum(len(m.content) for m in protocol_messages) + len(bot_response)
+                    }
+                }
+        
+        try:
+            result = await try_api_keys(make_static_request, config["api_key"])
+            return json(result)
         except Exception as e:
             return poe_exception_handler(e)
-        
-        if tool_flag:
-            return json(aggregate_chunk(partial_responses))
-        else:
-            bot_response = "".join(partial_responses)
-            response = {
-                "id": f"chatcmpl-{secrets.token_hex(16)}",
-                "object": "chat.completion",
-                "model": model,
-                "created": int(time.time()),
-                "choices": [
-                    {
-                        "message": {
-                            "content": bot_response,
-                            "role": "assistant"
-                        },
-                        "finish_reason": "stop",
-                        "index": 0
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": sum(len(m.content) for m in protocol_messages),
-                    "completion_tokens": len(bot_response),
-                    "total_tokens": sum(len(m.content) for m in protocol_messages) + len(bot_response)
-                }
-            }
-            return json(response)
 
 
 if __name__ == "__main__":

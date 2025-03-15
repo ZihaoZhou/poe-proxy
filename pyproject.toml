@@ -3,6 +3,7 @@ name = "poe-server"
 version = "0.1.0"
 description = ""
 authors = ["Zihao Zhou <ziz244@ucsd.edu>"]
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -10,6 +11,9 @@ fastapi-poe = "^0.0.42"
 sanic = "^23.12.1"
 Sanic-Cors = "^2.2.0"
 pyyaml = "^6.0.1"
+boto3 = "^1.37.11"
+setuptools = "^76.0.0"
+loguru = "^0.7.3"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

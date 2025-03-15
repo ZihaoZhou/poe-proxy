@@ -30,6 +30,29 @@ def setup_logging():
     return logging.getLogger("poe_proxy")
 
 
+def chunk_format(text_delta):
+    return {
+        "id": f"chatcmpl-{secrets.token_hex(16)}",
+        "object": "chat.completion.chunk",
+        "model": "bedrock",
+        "created": int(time.time()),
+        "choices": [
+            {
+                "delta": {
+                    "content": text_delta,
+                    "function_call": None,
+                    "role": "assistant",
+                    "tool_calls": None,
+                },
+                "finish_reason": None,
+                "index": 0,
+                "logprobs": None,
+            }
+        ],
+        "system_fingerprint": f"fp_{secrets.token_hex(8)}",
+    }
+
+
 def load_config():
     """Load configuration from YAML file"""
     with open("config.yaml", "r") as f:
@@ -50,6 +73,7 @@ class BedrockClient:
 
     # AWS model ID mapping
     MODEL_MAPPING = {
+        "Claude-3.7-Sonnet-Reasoning": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
         "Claude-3.7-Sonnet": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
         "Claude-3.5-Sonnet": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
         "Claude-3.5-Haiku": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
@@ -250,14 +274,17 @@ class BedrockHandler:
 
         return formatted_messages
 
-    def prepare_request_body(self, formatted_messages, temperature, stop_sequences):
+    def prepare_request_body(self, formatted_messages, temperature, stop_sequences, reasoning=False):
         """Prepare request body for AWS Bedrock"""
         request_body = {
             "anthropic_version": "bedrock-2023-05-31",
             "messages": formatted_messages,
-            "temperature": temperature,
+            "temperature": 1.0 if reasoning else temperature,
             "max_tokens": 8192,
-            "top_p": 0.9,
+            **({"thinking": {
+                "type": "enabled",
+                "budget_tokens": 4000
+            }} if reasoning else {}),
         }
 
         # Add stop sequences if provided
@@ -304,41 +331,34 @@ class BedrockHandler:
                     partial_json = json.loads(data_str)
 
                     chunk_type = partial_json.get("type")
+                    print(f"Chunk type: {chunk_type}")
 
-                    if chunk_type == "content_block_delta":
-                        text_delta = partial_json["delta"].get("text", "")
+                    if chunk_type == "content_block_start" or chunk_type == "content_block_stop":
+                        if "thinking" in request_body:
+                            chunk_data = chunk_format('\n***\n')
+                        else:
+                            chunk_data = ""
+                        await response.send("data: " + dumps(chunk_data) + "\n\n")
+                        # Yield control back to the event loop
+                        await asyncio.sleep(0)
+                    elif chunk_type == "content_block_delta":
+                        if partial_json["delta"].get("type", "") == "thinking_delta":
+                            text_delta = partial_json["delta"].get("thinking", "")
+                        else:
+                            text_delta = partial_json["delta"].get("text", "")
                         if text_delta:
-                            # Format the chunk in OpenAI-like format
-                            chunk_data = {
-                                "id": f"chatcmpl-{secrets.token_hex(16)}",
-                                "object": "chat.completion.chunk",
-                                "model": "bedrock",
-                                "created": int(time.time()),
-                                "choices": [
-                                    {
-                                        "delta": {
-                                            "content": text_delta,
-                                            "function_call": None,
-                                            "role": "assistant",
-                                            "tool_calls": None,
-                                        },
-                                        "finish_reason": None,
-                                        "index": 0,
-                                        "logprobs": None,
-                                    }
-                                ],
-                                "system_fingerprint": f"fp_{secrets.token_hex(8)}",
-                            }
+                            chunk_data = chunk_format(text_delta)
                             await response.send("data: " + dumps(chunk_data) + "\n\n")
                             # Yield control back to the event loop
                             await asyncio.sleep(0)
 
                     elif (
-                        chunk_type == "content_block_stop"
-                        or chunk_type == "message_stop"
+                        chunk_type == "message_stop"
                     ):
                         await response.send("data: [DONE]\n\n")
                         break
+                    else:
+                        continue
         
         return True
     
@@ -482,26 +502,7 @@ class PoeHandler:
         ):
             if partial.data is None:
                 # Handle text completion chunk
-                chunk = {
-                    "id": f"chatcmpl-{secrets.token_hex(16)}",
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "created": int(time.time()),
-                    "choices": [
-                        {
-                            "delta": {
-                                "content": partial.text,
-                                "function_call": None,
-                                "role": "assistant",
-                                "tool_calls": None,
-                            },
-                            "finish_reason": None,
-                            "index": 0,
-                            "logprobs": None,
-                        }
-                    ],
-                    "system_fingerprint": f"fp_{secrets.token_hex(8)}",
-                }
+                chunk = chunk_format(partial.text)
             else:
                 chunk = partial.data
 
@@ -621,7 +622,10 @@ def configure_app(app, config):
             if use_aws:
                 logger.info(f"Using AWS Bedrock backend for model: {model}")
 
+                reasoning = False
                 # Map the model name to AWS Bedrock model ID
+                if "Reasoning" in model:
+                    reasoning = True
                 model_id = bedrock_client.get_model_id(model)
                 if not model_id:
                     raise ValueError(f"Unsupported model for AWS Bedrock: {model}")
@@ -631,7 +635,7 @@ def configure_app(app, config):
 
                 # Prepare request body
                 request_body = bedrock_handler.prepare_request_body(
-                    formatted_messages, temperature, stop_sequences
+                    formatted_messages, temperature, stop_sequences, reasoning
                 )
 
                 if stream:

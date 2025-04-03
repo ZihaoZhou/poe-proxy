@@ -446,12 +446,22 @@ class PoeHandler:
                     tool_results = []
                 tool_results.append(ToolResultDefinition(**message))
             else:
+                assert "content" in message
+                content = ""
+                if isinstance(message["content"], str):
+                    content = message["content"]
+                elif isinstance(message["content"], list):
+                    for c in message["content"]:
+                        assert c['type'] in ["text"]
+                        if content != "":
+                            content += "\n---\n"
+                        content += c["text"]
                 role = message["role"].replace("assistant", "bot")
                 if "GPT" not in model or "Gemini" not in model or "gpt" not in model:
                     if role == "system":
                         continue
                 protocol_messages.append(
-                    fp.ProtocolMessage(role=role, content=message["content"])
+                    fp.ProtocolMessage(role=role, content=content)
                 )
 
         return protocol_messages, tool_calls, tool_results

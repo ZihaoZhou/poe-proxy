@@ -18,6 +18,7 @@ from aggregate import aggregate_chunk
 import requests
 import base64
 from loguru import logger as ll
+import filetype
 
 # =====================================================================
 # CONFIGURATION AND LOGGING
@@ -31,6 +32,17 @@ def setup_logging():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     return logging.getLogger("poe_proxy")
+
+
+def infer_format(raw_bytes):
+    """Infer the image format from raw bytes using the filetype library."""
+    kind = filetype.guess(raw_bytes)
+    
+    if kind is None:
+        return None
+    
+    # Return the extension without the dot
+    return kind.extension
 
 
 def chunk_format(text_delta):
@@ -81,7 +93,8 @@ class BedrockClient:
         "Claude-3.5-Sonnet":           "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
         "Claude-3.5-Haiku":            "us.anthropic.claude-3-5-haiku-20241022-v1:0",
         "Claude-3-Sonnet":             "us.anthropic.claude-3-sonnet-20240229-v1:0",
-        "Claude-3-Haiku":              "us.anthropic.claude-3-haiku-20240307-v1:0"
+        "Claude-3-Haiku":              "us.anthropic.claude-3-haiku-20240307-v1:0",
+        "DeepSeek-R1":                 "us.deepseek.r1-v1:0",
     }
 
     def __init__(self, config):
@@ -243,6 +256,7 @@ class API:
             "Claude-3.5-Haiku",
             "Claude-3-Sonnet",
             "Claude-3-Haiku",
+            "DeepSeek-R1",
         ]
 
     def engines_list(self):
@@ -286,6 +300,19 @@ class BedrockHandler:
             "name": "example.pdf", 
             "type": "application/pdf", 
             "content": "data:application/pdf;base64,JVBERi0xLjcN..."
+            }}
+        ]
+        }
+        
+        For a file from a URL:
+        {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is in this PDF?"},
+            {"type": "file", "file": {
+            "name": "example.pdf", 
+            "type": "application/pdf", 
+            "content": "http://example.com/myfile.pdf"
             }}
         ]
         }
@@ -340,11 +367,22 @@ class BedrockHandler:
                             elif "type" in c and c["type"] == "file" and "file" in c:
                                 file_obj = c["file"]
                                 file_name = file_obj.get("name", "document")
-                                file_type = file_obj.get("type", "application/pdf")
                                 file_data = file_obj.get("content", "")
-                                raw_bytes = self._extract_raw_bytes(file_data)
                                 
-                                doc_format = self._map_mime_to_extension(file_type)
+                                # Handle file from URL
+                                if file_data.startswith("http://") or file_data.startswith("https://"):
+                                    try:
+                                        resp = requests.get(file_data, timeout=30)
+                                        resp.raise_for_status()
+                                        raw_bytes = resp.content
+                                    except Exception as e:
+                                        ll.error(f"Failed to fetch file from URL {file_data}: {str(e)}")
+                                        raise ValueError(f"Failed to fetch file: {str(e)}")
+                                else:
+                                    # Handle base64 content
+                                    raw_bytes = self._extract_raw_bytes(file_data)
+                                
+                                doc_format = infer_format(raw_bytes)
                                 content_blocks.append({
                                     "document": {
                                         "name": self._sanitize_name(file_name), 
@@ -365,7 +403,7 @@ class BedrockHandler:
                                         raw_bytes = self._extract_raw_bytes(url)
                                         content_blocks.append({
                                             "image": {
-                                                "format": self._map_mime_to_extension(content_type, is_image=True),
+                                                "format": infer_format(raw_bytes),
                                                 "source": {
                                                     "bytes": raw_bytes
                                                 }
@@ -387,19 +425,8 @@ class BedrockHandler:
                                                     }
                                                 }
                                             })
-                                        except Exception as e:
-                                            logger.warning(f"Error fetching image from URL: {e}")
-                                            # Fallback to passing the URL directly
-                                            # Try to guess the format from the URL extension
-                                            extension = url.split(".")[-1].lower() if "." in url else "png"
-                                            content_blocks.append({
-                                                "image": {
-                                                    "format": extension,
-                                                    "source": {
-                                                        "url": url
-                                                    }
-                                                }
-                                            })
+                                        except Exception:
+                                            raise ValueError(f"Invalid or private image URL: {url}")
                         elif isinstance(c, str):
                             content_blocks.append({"text": c})
 
@@ -606,37 +633,6 @@ class BedrockHandler:
             # Not valid base64, return empty
             return b""
 
-    def _map_mime_to_extension(self, mime_type, is_image=False):
-        """
-        Simplistic function to map a MIME type to a short format label that Bedrock expects.
-        For PDFs, doc, docx, etc., you might expand this. For images, keep it simple.
-        """
-        # For docs
-        if mime_type in ("application/pdf", "pdf"):
-            return "pdf"
-        elif mime_type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"):
-            return "docx"
-        elif mime_type in ("application/msword", "doc"):
-            return "doc"
-        elif mime_type in ("text/plain", "txt"):
-            return "txt"
-        elif mime_type in ("text/html", "html"):
-            return "html"
-        elif mime_type in ("application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xls", "xlsx"):
-            return "xlsx"
-        # For images
-        if is_image:
-            if "png" in mime_type:
-                return "png"
-            elif "jpeg" in mime_type or "jpg" in mime_type:
-                return "jpeg"
-            elif "gif" in mime_type:
-                return "gif"
-            elif "webp" in mime_type:
-                return "webp"
-        # Fallback
-        return "pdf" if not is_image else "png"
-
     def _sanitize_name(self, name_str):
         """
         Because document names can only contain certain characters for Bedrock,
@@ -693,7 +689,7 @@ class PoeHandler:
                     content = message["content"]
                 elif isinstance(message["content"], list):
                     for c in message["content"]:
-                        assert c['type'] in ["text"]
+                        assert c['type'] in ["text"], "This model only supports text input. Please switch to Anthropic models or Deepseek R1."
                         if content != "":
                             content += "\n---\n"
                         content += c["text"]

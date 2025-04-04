@@ -41,8 +41,11 @@ def infer_format(raw_bytes):
     if kind is None:
         return None
     
+    extension = kind.extension
+    if extension == "jpg":
+        extension = "jpeg"
     # Return the extension without the dot
-    return kind.extension
+    return extension
 
 
 def chunk_format(text_delta):

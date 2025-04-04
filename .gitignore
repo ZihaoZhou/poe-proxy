@@ -17,3 +17,4 @@ __pycache__/
 *.cover
 *.hypothesis/
 *.tox/
+/.vscode/

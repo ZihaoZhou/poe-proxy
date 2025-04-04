@@ -15,6 +15,9 @@ from base64 import urlsafe_b64encode
 from fastapi_poe.client import PROTOCOL_VERSION, stream_request_base
 from fastapi_poe.types import QueryRequest, ToolResultDefinition, ToolCallDefinition
 from aggregate import aggregate_chunk
+import requests
+import base64
+from loguru import logger as ll
 
 # =====================================================================
 # CONFIGURATION AND LOGGING
@@ -74,59 +77,70 @@ class BedrockClient:
     # AWS model ID mapping
     MODEL_MAPPING = {
         "Claude-3.7-Sonnet-Reasoning": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "Claude-3.7-Sonnet": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-        "Claude-3.5-Sonnet": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "Claude-3.5-Haiku": "us.anthropic.claude-3-5-haiku-20241022-v1:0",
-        "Claude-3-Sonnet": "us.anthropic.claude-3-sonnet-20240229-v1:0",
-        "Claude-3-Haiku": "us.anthropic.claude-3-haiku-20240307-v1:0",
+        "Claude-3.7-Sonnet":           "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "Claude-3.5-Sonnet":           "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "Claude-3.5-Haiku":            "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+        "Claude-3-Sonnet":             "us.anthropic.claude-3-sonnet-20240229-v1:0",
+        "Claude-3-Haiku":              "us.anthropic.claude-3-haiku-20240307-v1:0"
     }
 
     def __init__(self, config):
-        """Initialize AWS Bedrock client if credentials are available"""
         self.client = None
         self.available = False
 
-        # Check if AWS credentials are available
+        # ---------------------------------
+        # 1) AWS credentials check
+        # ---------------------------------
         has_aws_credentials = (
             config.get("aws_access_key_id") is not None
             and config.get("aws_secret_access_key") is not None
         )
 
+        # ---------------------------------
+        # 2) Initialize client if possible
+        # ---------------------------------
         if has_aws_credentials:
-            logger.info("AWS credentials found. AWS Bedrock backend is available.")
-            # Initialize AWS Bedrock client
+            logging.info("AWS credentials found. Initializing bedrock-runtime client.")
             try:
                 self.client = boto3.client(
                     service_name="bedrock-runtime",
-                    region_name=os.environ.get("AWS_REGION", "us-east-2"),
+                    region_name=os.environ.get("AWS_REGION", "us-east-1"),
                     aws_access_key_id=config["aws_access_key_id"],
                     aws_secret_access_key=config["aws_secret_access_key"],
                 )
                 self.available = True
-                logger.info("AWS Bedrock client initialized successfully.")
+                logging.info("AWS Bedrock client (bedrock-runtime) initialized successfully.")
             except Exception as e:
-                logger.error(f"Failed to initialize AWS Bedrock client: {str(e)}")
+                logging.error(f"Failed to initialize AWS Bedrock client: {str(e)}")
         else:
-            logger.info("AWS credentials not found. Using Poe backend only.")
+            logging.warning("AWS credentials not found. The Bedrock client is unavailable.")
 
-        # Create extended model mapping with "-200k" variants
+        # ---------------------------------
+        # 3) Add extended mapping variants
+        # ---------------------------------
         extended_mapping = {}
-        for model, model_id in self.MODEL_MAPPING.items():
-            extended_mapping[model + "-200k"] = model_id
-            # uncapitalized version
-            extended_mapping[model.lower()] = model_id
-            extended_mapping[model.lower() + "-200k"] = model_id
+        # For each existing model in MODEL_MAPPING, add:
+        #   - A '-200k' variant
+        #   - A lowercase version
+        #   - A lowercase '-200k' variant
+        for model_name, bedrock_id in self.MODEL_MAPPING.items():
+            # '-200k' version
+            extended_mapping[model_name + "-200k"] = bedrock_id
+            # lowercase
+            lowercase_name = model_name.lower()
+            extended_mapping[lowercase_name] = bedrock_id
+            extended_mapping[lowercase_name + "-200k"] = bedrock_id
 
-        # Merge the dictionaries to include both regular and 200k variants
+        # Merge them back into our dict
         self.MODEL_MAPPING.update(extended_mapping)
 
-    def is_model_supported(self, model):
-        """Check if model is supported by AWS Bedrock"""
-        return self.available and model in self.MODEL_MAPPING
+    def is_model_supported(self, model_name: str) -> bool:
+        """Check if a given model name is mapped and available."""
+        return self.available and (model_name in self.MODEL_MAPPING)
 
-    def get_model_id(self, model):
-        """Get AWS Bedrock model ID for the given model name"""
-        return self.MODEL_MAPPING.get(model)
+    def get_model_id(self, model_name: str) -> str:
+        """Return the underlying Bedrock model ID for the user-supplied model name."""
+        return self.MODEL_MAPPING.get(model_name)
 
 
 # =====================================================================
@@ -248,55 +262,205 @@ class API:
 
 
 class BedrockHandler:
-    """Handle AWS Bedrock requests"""
+    """
+    Handle AWS Bedrock requests using the `converse` and `converse_stream` APIs.
+
+    This version supports documents and images via raw bytes, as well as streaming
+    and static (non-streaming) requests. 
+    """
 
     def __init__(self, bedrock_client):
-        self.bedrock = bedrock_client.client
+        self.bedrock = bedrock_client
 
     def format_messages(self, messages):
-        """Format messages for AWS Bedrock"""
+        """
+        Convert OpenAI-style messages into the format required by Bedrock's
+        `converse` API. For documents/images, pass the raw bytes, not base64.
+
+        Expected input example for a PDF/file:
+        {
+        "role": "user", 
+        "content": [
+            {"type": "text", "text": "What is in this PDF?"},
+            {"type": "file", "file": {
+            "name": "example.pdf", 
+            "type": "application/pdf", 
+            "content": "data:application/pdf;base64,JVBERi0xLjcN..."
+            }}
+        ]
+        }
+
+        For an image from a URL:
+        {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {
+            "url": "http://example.com/myimage.png",
+            "detail": "auto"
+            }}
+        ]
+        }
+
+        For an image already in base64:
+        {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What is in this image?"},
+            {"type": "image_url", "image_url": {
+            "url": "data:image/png;base64,iVBORw0K...",
+            "detail": "auto"
+            }}
+        ]
+        }
+        """
         formatted_messages = []
         for message in messages:
             role = message.get("role", "")
-            content = message.get("content", "")
-
-            # Skip empty content
-            if not content:
-                continue
-
-            # Map roles to AWS Bedrock format
+            # Doesn't support "system" role in this context
             if role == "system":
-                continue  # Skip system messages
-            elif role == "user":
-                formatted_messages.append({"role": "user", "content": content})
-            elif role == "assistant":
-                formatted_messages.append({"role": "assistant", "content": content})
+                continue
+            
+            # We will build an array of content blocks in the style Anthropic expects
+            # Each block is typically {"text": "..."} or {"document": {...}} or {"image": {...}}
+            content_blocks = []
+
+            # Process the message content which must be an array in the new format
+            if "content" in message:
+                raw_content = message["content"]
+                # If content is a string, treat it as plain text (for simple messages)
+                if isinstance(raw_content, str) and raw_content.strip():
+                    content_blocks.append({"text": raw_content})
+                # If content is a list, process each item based on its type
+                elif isinstance(raw_content, list):
+                    for c in raw_content:
+                        if isinstance(c, dict):
+                            if "type" in c and c["type"] == "text" and "text" in c:
+                                content_blocks.append({"text": c["text"]})
+                            elif "type" in c and c["type"] == "file" and "file" in c:
+                                file_obj = c["file"]
+                                file_name = file_obj.get("name", "document")
+                                file_type = file_obj.get("type", "application/pdf")
+                                file_data = file_obj.get("content", "")
+                                raw_bytes = self._extract_raw_bytes(file_data)
+                                
+                                doc_format = self._map_mime_to_extension(file_type)
+                                content_blocks.append({
+                                    "document": {
+                                        "name": self._sanitize_name(file_name), 
+                                        "format": doc_format,
+                                        "source": {
+                                            "bytes": raw_bytes
+                                        }
+                                    }
+                                })
+                            elif "type" in c and c["type"] == "image_url" and "image_url" in c:
+                                image_obj = c["image_url"]
+                                if "url" in image_obj:
+                                    url = image_obj["url"]
+                                    # Check if it's a data URL or a regular URL
+                                    if url.startswith("data:"):
+                                        # Extract content type from data URL (e.g., "image/png")
+                                        content_type = url.split(";")[0].split(":")[1] if ";" in url else "image/png"
+                                        raw_bytes = self._extract_raw_bytes(url)
+                                        content_blocks.append({
+                                            "image": {
+                                                "format": self._map_mime_to_extension(content_type, is_image=True),
+                                                "source": {
+                                                    "bytes": raw_bytes
+                                                }
+                                            }
+                                        })
+                                    else:
+                                        # It's a regular URL, fetch it
+                                        try:
+                                            resp = requests.get(url, timeout=10)
+                                            resp.raise_for_status()
+                                            raw_bytes = resp.content
+                                            # Try to determine content type from response headers or URL
+                                            content_type = resp.headers.get("Content-Type", "image/png")
+                                            content_blocks.append({
+                                                "image": {
+                                                    "format": self._map_mime_to_extension(content_type, is_image=True),
+                                                    "source": {
+                                                        "bytes": raw_bytes
+                                                    }
+                                                }
+                                            })
+                                        except Exception as e:
+                                            logger.warning(f"Error fetching image from URL: {e}")
+                                            # Fallback to passing the URL directly
+                                            # Try to guess the format from the URL extension
+                                            extension = url.split(".")[-1].lower() if "." in url else "png"
+                                            content_blocks.append({
+                                                "image": {
+                                                    "format": extension,
+                                                    "source": {
+                                                        "url": url
+                                                    }
+                                                }
+                                            })
+                        elif isinstance(c, str):
+                            content_blocks.append({"text": c})
+
+            # If we collected any content blocks, add them
+            if content_blocks:
+                formatted_messages.append({
+                    "role": role,
+                    "content": content_blocks
+                })
 
         return formatted_messages
 
-    def prepare_request_body(self, formatted_messages, temperature, stop_sequences, reasoning=False):
-        """Prepare request body for AWS Bedrock"""
-        request_body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "messages": formatted_messages,
-            "temperature": 1.0 if reasoning else temperature,
-            "max_tokens": 8192,
-            **({"thinking": {
-                "type": "enabled",
-                "budget_tokens": 4000
-            }} if reasoning else {}),
+    def prepare_request_body(self, formatted_messages, temperature, top_p, stop_sequences, reasoning=False):
+        """
+        Build the request body for the `converse` or `converse_stream` call.
+        The temperature and other parameters should be in the inferenceConfig object.
+        
+        For example:
+        {
+            "modelId": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "messages": [...],
+            "inferenceConfig": {
+                "temperature": 0.7,
+                "stopSequences": [...]
+            }
         }
-
+        """
+        # Create the inferenceConfig object
+        inference_config = {
+            "temperature": temperature,
+            "topP": top_p
+        }
+        
         # Add stop sequences if provided
         if stop_sequences:
-            request_body["stop_sequences"] = stop_sequences
+            inference_config["stopSequences"] = stop_sequences
+
+        # Build the complete request body
+        request_body = {
+            "messages": formatted_messages
+        }
+        
+        if reasoning:
+            request_body["additionalModelRequestFields"] = {
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 4000
+                }
+            }
+        else:
+            request_body["inferenceConfig"] = inference_config
 
         return request_body
     
     async def handle_stream(self, request, model_id, request_body, response=None):
         """
-        Handle streaming response from AWS Bedrock
-        Now accepts a pre-created response object to avoid creating it multiple times
+        Handle streaming response from AWS Bedrock using `converse_stream`.
+
+        `request_body` should contain the `messages` list (and temperature, etc.).
+        We run the synchronous call in a thread executor, then parse each streaming chunk
+        and convert it to OpenAI-like chunk_format.
         """
         # Only create a response if one wasn't provided (first attempt)
         if response is None:
@@ -309,82 +473,97 @@ class BedrockHandler:
                 },
             )
 
-        # Run the synchronous AWS call in a separate thread
+        # Run the synchronous `converse_stream` in a separate thread
         loop = asyncio.get_event_loop()
         aws_response = await loop.run_in_executor(
-            None,  # Use default executor
-            lambda: self.bedrock.invoke_model_with_response_stream(
+            None,
+            lambda: self.bedrock.client.converse_stream(
                 modelId=model_id,
-                contentType="application/json",
-                accept="*/*",
-                body=json.dumps(request_body),
+                **request_body
             ),
         )
 
-        aws_stream = aws_response.get("body")
-        if aws_stream:
-            # Process the stream chunks
-            for event in aws_stream:
-                chunk = event.get("chunk")
-                if chunk:
-                    data_str = chunk["bytes"].decode("utf-8")
-                    partial_json = json.loads(data_str)
+        # The 'stream' key should contain the streaming events
+        aws_stream = aws_response.get("stream", [])
+        start_reasoning = False
+        for event in aws_stream:
+            if "messageStart" in event:
+                continue
 
-                    chunk_type = partial_json.get("type")
-                    print(f"Chunk type: {chunk_type}")
-
-                    if chunk_type == "content_block_start" or chunk_type == "content_block_stop":
-                        if "thinking" in request_body:
-                            chunk_data = chunk_format('\n***\n')
-                        else:
-                            chunk_data = ""
-                        await response.send("data: " + dumps(chunk_data) + "\n\n")
-                        # Yield control back to the event loop
-                        await asyncio.sleep(0)
-                    elif chunk_type == "content_block_delta":
-                        if partial_json["delta"].get("type", "") == "thinking_delta":
-                            text_delta = partial_json["delta"].get("thinking", "")
-                        else:
-                            text_delta = partial_json["delta"].get("text", "")
-                        if text_delta:
-                            chunk_data = chunk_format(text_delta)
-                            await response.send("data: " + dumps(chunk_data) + "\n\n")
-                            # Yield control back to the event loop
-                            await asyncio.sleep(0)
-
-                    elif (
-                        chunk_type == "message_stop"
-                    ):
-                        await response.send("data: [DONE]\n\n")
-                        break
+            elif "contentBlockDelta" in event:
+                # This is the actual partial text chunk
+                delta = event["contentBlockDelta"].get("delta", {})
+                
+                # Handle reasoning part
+                if "reasoningContent" in delta:
+                    text = delta["reasoningContent"].get("text", "")
+                    if not start_reasoning:
+                        text = "> " + text
+                        start_reasoning = True
                     else:
-                        continue
-        
+                        text = text.replace("\n", "\n> ")
+                else:
+                    text = delta.get("text", "")
+                    if start_reasoning:
+                        start_reasoning = False
+                        text = "\n\n" + text
+                if text:
+                    # Wrap in OpenAI-like chunk format
+                    chunk_data = chunk_format(text)
+                    await response.send("data: " + json.dumps(chunk_data) + "\n\n")
+
+            elif "contentBlockStop" in event:
+                # End of a chunk block
+                continue
+
+            elif "messageStop" in event:
+                await response.send("data: [DONE]\n\n")
+                break
+
+            elif "metadata" in event:
+                pass
+
+            # Yield control back to the event loop
+            await asyncio.sleep(0)
+
         return True
     
     async def handle_static(self, model_id, request_body):
-        """Handle static (non-streaming) response from AWS Bedrock"""
-        # Run the synchronous AWS call in a separate thread
+        """
+        Handle non-streaming (synchronous) response from AWS Bedrock using `converse`.
+        We'll call `converse` in a thread executor, parse the JSON result, and wrap it
+        in an OpenAI-like completion structure.
+        """
         loop = asyncio.get_event_loop()
         aws_response = await loop.run_in_executor(
-            None,  # Use default executor
-            lambda: self.bedrock.invoke_model(
+            None,
+            lambda: self.bedrock.client.converse(
                 modelId=model_id,
-                contentType="application/json",
-                accept="*/*",
-                body=json.dumps(request_body),
+                **request_body
             ),
         )
-        
-        # Parse the response body
-        response_body = json.loads(aws_response["body"].read())
-        
-        # Extract the response text
+        # The response for a non-streaming call is typically a single message from Claude
+        # For example:
+        # {
+        #   "messages":[
+        #       {"content":[{"text":"Hello, world!"}], "role":"assistant"}
+        #   ],
+        #   "metadata": {... usage stats...}
+        # }
+        messages = aws_response.get("messages", [])
         assistant_message = ""
-        if "content" in response_body:
-            assistant_message = response_body["content"][0]["text"]
-        
-        # Format in OpenAI-compatible response format
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                # It's an array of content blocks: e.g. [{"text":"some text"}, {"text":"..."}, ...]
+                content_list = msg.get("content", [])
+                for c in content_list:
+                    # c might be {"text": "..."} or {"document": {...}} or {"image": {...}}
+                    if "text" in c:
+                        assistant_message += c["text"]
+                # We only gather from the first assistant block or combine them all
+                break
+
+        # Wrap it in an OpenAI-style JSON
         return {
             "id": f"chatcmpl-{secrets.token_hex(16)}",
             "object": "chat.completion",
@@ -398,11 +577,73 @@ class BedrockHandler:
                 }
             ],
             "usage": {
-                "prompt_tokens": -1,  # AWS doesn't provide token counts
+                "prompt_tokens": -1,  # Not provided by Bedrock
                 "completion_tokens": -1,
                 "total_tokens": -1,
             },
         }
+
+    # ----------------------------------------------------------------
+    # HELPER FUNCTIONS
+    # ----------------------------------------------------------------
+
+    def _extract_raw_bytes(self, data_uri):
+        """
+        Given a data URI like 'data:application/pdf;base64,JVBERi0xLjcN...' or
+        'data:image/png;base64,iVBOR...', return the raw bytes.
+        If `data_uri` is empty or unrecognized, return b''.
+        """
+        if not data_uri:
+            return b""
+        # Typical structure: data:<mime>;base64,<base64_data>
+        if data_uri.startswith("data:") and ";base64," in data_uri:
+            base64_part = data_uri.split(";base64,", 1)[1]
+            return base64.b64decode(base64_part)
+        # In case it's plain base64, no prefix:
+        try:
+            return base64.b64decode(data_uri)
+        except Exception:
+            # Not valid base64, return empty
+            return b""
+
+    def _map_mime_to_extension(self, mime_type, is_image=False):
+        """
+        Simplistic function to map a MIME type to a short format label that Bedrock expects.
+        For PDFs, doc, docx, etc., you might expand this. For images, keep it simple.
+        """
+        # For docs
+        if mime_type in ("application/pdf", "pdf"):
+            return "pdf"
+        elif mime_type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"):
+            return "docx"
+        elif mime_type in ("application/msword", "doc"):
+            return "doc"
+        elif mime_type in ("text/plain", "txt"):
+            return "txt"
+        elif mime_type in ("text/html", "html"):
+            return "html"
+        elif mime_type in ("application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xls", "xlsx"):
+            return "xlsx"
+        # For images
+        if is_image:
+            if "png" in mime_type:
+                return "png"
+            elif "jpeg" in mime_type or "jpg" in mime_type:
+                return "jpeg"
+            elif "gif" in mime_type:
+                return "gif"
+            elif "webp" in mime_type:
+                return "webp"
+        # Fallback
+        return "pdf" if not is_image else "png"
+
+    def _sanitize_name(self, name_str):
+        """
+        Because document names can only contain certain characters for Bedrock,
+        remove/replace disallowed characters. (Just an example.)
+        """
+        import re
+        return re.sub(r"[^0-9A-Za-z \-\(\)\[\]]", "_", name_str)
 
 
 # =====================================================================
@@ -597,6 +838,7 @@ def configure_app(app, config):
             kws = request.json
             messages = kws.pop("messages", None)
             model = kws.pop("model", "GPT-4")
+            top_p = kws.pop("top_p", 1.0)
             stop_sequences = kws.pop("stop", [])
             logit_bias = kws.pop("logit_bias", {})
             temperature = kws.pop("temperature", 0.7)
@@ -645,7 +887,7 @@ def configure_app(app, config):
 
                 # Prepare request body
                 request_body = bedrock_handler.prepare_request_body(
-                    formatted_messages, temperature, stop_sequences, reasoning
+                    formatted_messages, temperature, top_p, stop_sequences, reasoning
                 )
 
                 if stream:

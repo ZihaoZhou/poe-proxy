@@ -91,6 +91,8 @@ class BedrockClient:
 
     # AWS model ID mapping
     MODEL_MAPPING = {
+        "Claude-4-Sonnet-Reasoning":   "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "Claude-4-Sonnet":             "us.anthropic.claude-sonnet-4-20250514-v1:0",
         "Claude-3.7-Sonnet-Reasoning": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
         "Claude-3.7-Sonnet":           "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
         "Claude-3.5-Sonnet":           "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -254,6 +256,7 @@ class API:
 
     def __init__(self):
         self.models = [
+            "Claude-4-Sonnet",
             "Claude-3.7-Sonnet",
             "Claude-3.5-Sonnet",
             "Claude-3.5-Haiku",
